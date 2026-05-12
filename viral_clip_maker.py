@@ -14,6 +14,21 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+# 自动加载同目录下的 .env 文件
+def _load_dotenv():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+_load_dotenv()
+
 # ============================================================
 # 依赖检查
 # ============================================================
@@ -76,7 +91,33 @@ class Segment:
 # ============================================================
 # Step 1: 下载 YouTube 视频
 # ============================================================
-def download_youtube(url: str, output_dir: str) -> str:
+def _session_cache_path(output_dir: str) -> str:
+    return os.path.join(output_dir, "_work", "session.json")
+
+
+def _load_session(output_dir: str) -> dict:
+    path = _session_cache_path(output_dir)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_session(output_dir: str, data: dict) -> None:
+    path = _session_cache_path(output_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def download_youtube(url: str, output_dir: str, session: dict) -> str:
+    # 同一个链接且文件还在，直接复用
+    if session.get("url") == url and session.get("video_path"):
+        cached = session["video_path"]
+        if os.path.exists(cached):
+            print(f"[Step 1] 使用已下载的视频: {os.path.basename(cached)}")
+            return cached
+
     os.makedirs(output_dir, exist_ok=True)
     ydl_opts = {
         "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
@@ -93,7 +134,6 @@ def download_youtube(url: str, output_dir: str) -> str:
             filename = os.path.splitext(filename)[0] + ".mp4"
 
     if not os.path.exists(filename):
-        # yt-dlp 有时会在文件名上加后缀
         candidates = [f for f in os.listdir(output_dir) if f.endswith(".mp4")]
         if not candidates:
             sys.exit("下载失败：找不到 mp4 文件")
@@ -220,7 +260,7 @@ SCORE_PROMPT = """\
 5. 传播潜力（看完是否想分享）
 
 只返回 JSON 数组，格式：
-[{"index": 0, "score": 8.5, "reason": "一句话原因"}, ...]
+[{{"index": 0, "score": 8.5, "reason": "一句话原因"}}, ...]
 
 片段列表：
 {segments_json}
@@ -451,13 +491,19 @@ def main():
     print("  爆款短视频自动剪辑工具")
     print("=" * 50)
 
+    session = _load_session(args.output)
+
     if not args.url:
-        args.url = input("\n请输入 YouTube 视频链接: ").strip()
+        last = session.get("url", "")
+        prompt = f"\n请输入 YouTube 视频链接（直接回车复用上次: {last}）: " if last else "\n请输入 YouTube 视频链接: "
+        entered = input(prompt).strip()
+        args.url = entered or last
     if not args.url:
         sys.exit("未输入链接，退出。")
 
     # Step 1
-    video_path = download_youtube(args.url, work_dir)
+    video_path = download_youtube(args.url, work_dir, session)
+    _save_session(args.output, {"url": args.url, "video_path": video_path})
 
     # Step 2
     whisper_segs = transcribe(video_path, args.whisper_model)
