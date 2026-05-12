@@ -104,15 +104,27 @@ def download_youtube(url: str, output_dir: str) -> str:
 
 
 # ============================================================
-# Step 2: Whisper 转录（带时间戳）
+# Step 2: Whisper 转录（带时间戳，自动缓存）
 # ============================================================
 def transcribe(video_path: str, model_size: str = WHISPER_MODEL) -> List[dict]:
+    cache_path = video_path + ".whisper.json"
+
+    if os.path.exists(cache_path):
+        print(f"[Step 2] 读取转录缓存: {os.path.basename(cache_path)}")
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"  → 共 {len(data['segments'])} 段，语言: {data.get('language', '未知')}（已缓存）")
+        return data["segments"]
+
     print(f"[Step 2] Whisper 转录（模型: {model_size}）...")
     model = whisper.load_model(model_size)
     result = model.transcribe(video_path, verbose=False)
     segs = result["segments"]
     lang = result.get("language", "未知")
-    print(f"  → 共 {len(segs)} 段，检测语言: {lang}")
+
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump({"language": lang, "segments": segs}, f, ensure_ascii=False, indent=2)
+    print(f"  → 共 {len(segs)} 段，检测语言: {lang}（已缓存到 {os.path.basename(cache_path)}）")
     return segs
 
 
