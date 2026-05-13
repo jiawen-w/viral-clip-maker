@@ -25,7 +25,7 @@ def _load_dotenv():
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, val = line.partition("=")
-            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+            os.environ[key.strip()] = val.strip().strip('"').strip("'")
 
 _load_dotenv()
 
@@ -267,16 +267,45 @@ SCORE_PROMPT = """\
 """
 
 
+def _call_api(prompt: str, model: str, api_key: Optional[str]) -> str:
+    """统一 API 调用：自定义 base_url 时直接用 httpx 发 Anthropic 格式请求，避免 SDK URL 拼接问题。"""
+    import httpx
+
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+    token = api_key or os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+
+    if base_url:
+        # 直接拼接，避免 Anthropic SDK 内部 URL 路径被截断
+        url = f"{base_url}/v1/messages"
+        headers = {
+            "x-api-key": token,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        r = httpx.post(url, headers=headers, json=body, timeout=120)
+        r.raise_for_status()
+        return r.json()["content"][0]["text"]
+    else:
+        # 原生 Anthropic SDK（官方 API Key）
+        client = anthropic.Anthropic(api_key=token)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text
+
+
 def score_with_claude(
     segments: List[Segment],
     api_key: Optional[str] = None,
     model: str = CLAUDE_MODEL,
 ) -> List[Segment]:
-    client = anthropic.Anthropic(
-        api_key=api_key or os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"),
-        base_url=os.environ.get("ANTHROPIC_BASE_URL"),
-    )
-
     payload = [
         {
             "index": i,
@@ -286,19 +315,11 @@ def score_with_claude(
         for i, seg in enumerate(segments)
     ]
 
-    print(f"[Step 5] Claude 打分（{len(segments)} 个片段）...")
-    resp = client.messages.create(
-        model=model,
-        max_tokens=2048,
-        messages=[{
-            "role": "user",
-            "content": SCORE_PROMPT.format(
-                segments_json=json.dumps(payload, ensure_ascii=False, indent=2)
-            ),
-        }],
+    print(f"[Step 5] AI 打分（{len(segments)} 个片段）...")
+    prompt = SCORE_PROMPT.format(
+        segments_json=json.dumps(payload, ensure_ascii=False, indent=2)
     )
-
-    raw = resp.content[0].text
+    raw = _call_api(prompt, model, api_key)
     match = re.search(r"\[.*?\]", raw, re.DOTALL)
     if not match:
         raise ValueError(f"Claude 返回格式异常:\n{raw[:300]}")
@@ -381,18 +402,76 @@ def _detect_face_cx(video_path: str, timestamp: float, frame_width: int) -> int:
 
 
 # ============================================================
-# Step 7: 生成 SRT 字幕
+# Step 7: 生成 ASS 字幕（样式内嵌，避免 ffmpeg force_style 引号转义问题）
 # ============================================================
-def _srt_time(s: float) -> str:
+ASS_HEADER = """\
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Default,Arial,64,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,100,1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+"""
+
+
+def _ass_time(s: float) -> str:
     h = int(s // 3600)
     m = int((s % 3600) // 60)
     sec = s % 60
-    return f"{h:02d}:{m:02d}:{sec:06.3f}".replace(".", ",")
+    return f"{h}:{m:02d}:{sec:05.2f}"
 
 
-def write_srt(whisper_segs: List[dict], seg: Segment, srt_path: str) -> None:
-    lines = []
-    idx = 1
+def write_ass(whisper_segs: List[dict], seg: Segment, ass_path: str) -> None:
+    lines = [ASS_HEADER]
+    for ws in whisper_segs:
+        if ws["end"] <= seg.start or ws["start"] >= seg.end:
+            continue
+        s = max(ws["start"], seg.start) - seg.start
+        e = min(ws["end"], seg.end) - seg.start
+        text = ws["text"].strip().replace("\n", "\\N")
+        if not text or e <= s:
+            continue
+        lines.append(f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Default,,0,0,0,,{text}")
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+# ============================================================
+# Step 8: ffmpeg 剪辑 + 字幕烧录
+# ============================================================
+def _find_chinese_font() -> Optional[str]:
+    for path in [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _has_subtitles_filter() -> bool:
+    try:
+        r = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True)
+        return " subtitles " in r.stdout
+    except Exception:
+        return False
+
+
+def build_drawtext_chain(whisper_segs: List[dict], seg: Segment, work_dir: str, clip_idx: int) -> str:
+    """ffmpeg 没有 libass 时，用 drawtext 逐行绘制字幕。文本写到 txt 文件避免转义。"""
+    font = _find_chinese_font()
+    if not font:
+        return ""
+
+    filters = []
+    txt_idx = 0
     for ws in whisper_segs:
         if ws["end"] <= seg.start or ws["start"] >= seg.end:
             continue
@@ -401,15 +480,26 @@ def write_srt(whisper_segs: List[dict], seg: Segment, srt_path: str) -> None:
         text = ws["text"].strip()
         if not text or e <= s:
             continue
-        lines += [str(idx), f"{_srt_time(s)} --> {_srt_time(e)}", text, ""]
-        idx += 1
-    with open(srt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        # 每行字幕写一个 txt 文件，drawtext 用 textfile 读取（避免特殊字符转义）
+        txt_path = f"/tmp/viral_sub_{clip_idx:02d}_{txt_idx:03d}.txt"
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        txt_idx += 1
+
+        filters.append(
+            f"drawtext=fontfile='{font}'"
+            f":textfile={txt_path}"
+            f":fontsize=56"
+            f":fontcolor=white"
+            f":borderw=4"
+            f":bordercolor=black"
+            f":x=(w-text_w)/2"
+            f":y=h-220"
+            f":enable='between(t\\,{s:.3f}\\,{e:.3f})'"
+        )
+    return ",".join(filters)
 
 
-# ============================================================
-# Step 8: ffmpeg 剪辑 + 字幕烧录
-# ============================================================
 def export_clip(
     video_path: str,
     seg: Segment,
@@ -418,26 +508,21 @@ def export_clip(
     clip_idx: int,
     work_dir: str,
 ) -> None:
-    srt_path = os.path.join(work_dir, f"clip_{clip_idx:02d}.srt")
-    write_srt(whisper_segs, seg, srt_path)
-
     crop_filter = build_crop_filter(video_path, seg)
     duration = seg.end - seg.start
 
-    # ffmpeg 的 subtitles 滤镜路径在 Windows 上需要转义冒号，macOS/Linux 直接用
-    srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
-    subtitle_style = (
-        "FontName=Arial,"
-        "FontSize=64,"
-        "PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,"
-        "BackColour=&H80000000,"
-        "Outline=2,Shadow=1,"
-        "Alignment=2,MarginV=100"
-    )
-    subtitle_filter = f"subtitles='{srt_escaped}':force_style='{subtitle_style}'"
+    # 优先使用 subtitles 滤镜（需 libass），否则降级用 drawtext
+    if _has_subtitles_filter():
+        import shutil
+        ass_path = os.path.join(work_dir, f"clip_{clip_idx:02d}.ass")
+        write_ass(whisper_segs, seg, ass_path)
+        tmp_ass = f"/tmp/viral_clip_{clip_idx:02d}.ass"
+        shutil.copy2(ass_path, tmp_ass)
+        sub_filter = f"subtitles={tmp_ass}"
+    else:
+        sub_filter = build_drawtext_chain(whisper_segs, seg, work_dir, clip_idx)
 
-    vf = f"{crop_filter},{subtitle_filter}"
+    vf = f"{crop_filter},{sub_filter}" if sub_filter else crop_filter
 
     cmd = [
         "ffmpeg", "-y",
@@ -542,3 +627,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
