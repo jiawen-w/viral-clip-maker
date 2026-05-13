@@ -1,4 +1,4 @@
-# 🎬 Viral Clip Maker
+# Viral Clip Maker
 
 自动将长视频剪辑成爆款短视频。输入一个 YouTube 链接，输出多个适配抖音/视频号/Reels 的竖屏短视频。
 
@@ -7,9 +7,9 @@
 ```
 YouTube 链接
     ↓
-① yt-dlp 下载视频
+① yt-dlp 下载视频（已下载自动跳过）
     ↓
-② Whisper 语音转文字（带时间戳）
+② Whisper 语音转文字（带时间戳，结果自动缓存）
     ↓
 ③ PySceneDetect 镜头边界检测
     ↓
@@ -19,7 +19,7 @@ YouTube 链接
     ↓
 ⑥ OpenCV 人脸居中裁剪（竖屏 9:16）
     ↓
-⑦ ffmpeg 剪辑 + 字幕烧录
+⑦ ffmpeg 剪辑 + ASS 字幕烧录
     ↓
 输出短视频 short_01_score9.mp4 ...
 ```
@@ -27,15 +27,18 @@ YouTube 链接
 ## 环境要求
 
 - Python 3.9+
-- ffmpeg（需在系统 PATH 中）
+- ffmpeg（需含 libass，用于字幕烧录）
 
 ```bash
-# macOS
-brew install ffmpeg
+# macOS — 使用含完整编解码器的版本
+brew tap homebrew-ffmpeg/ffmpeg
+brew install homebrew-ffmpeg/ffmpeg/ffmpeg
 
 # Ubuntu
 apt install ffmpeg
 ```
+
+> 注意：`brew install ffmpeg` 安装的精简版不含 libass，会导致字幕烧录失败，请使用上面的完整版。
 
 ## 安装
 
@@ -49,28 +52,28 @@ pip install yt-dlp openai-whisper scenedetect anthropic opencv-python
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入你的 Key
+# 编辑 .env，填入你的 Key（.env 已加入 .gitignore，不会上传）
 ```
 
 **使用 Claude 官方 API：**
-```bash
-export ANTHROPIC_API_KEY=your_key_here
+```
+ANTHROPIC_API_KEY=your_key_here
 ```
 
-**使用豆包 / 其他兼容 API：**
-```bash
-export ANTHROPIC_BASE_URL=https://ark.cn-beijing.volces.com/api/coding
-export ANTHROPIC_AUTH_TOKEN=your_token_here
-export ANTHROPIC_MODEL=doubao-seed-2.0-pro
+**使用豆包 / 火山引擎 Coding Plan：**
+```
+ANTHROPIC_BASE_URL=https://ark.cn-beijing.volces.com/api/coding
+ANTHROPIC_AUTH_TOKEN=your_token_here
+ANTHROPIC_MODEL=doubao-seed-2.0-pro
 ```
 
 ## 使用
 
 ```bash
-# 直接运行，按提示输入 YouTube 链接
+# 直接运行，按提示输入 YouTube 链接（再次运行可回车复用上次）
 python viral_clip_maker.py
 
-# 或者直接传入链接
+# 或直接传入链接
 python viral_clip_maker.py "https://www.youtube.com/watch?v=xxxxx"
 ```
 
@@ -85,6 +88,17 @@ python viral_clip_maker.py "链接" \
   --max-dur 60 \            # 片段最长秒数（默认 90）
   --scene-threshold 25      # 场景检测灵敏度，越小越灵敏（默认 30）
 ```
+
+## 缓存机制
+
+重复运行同一视频时，以下步骤自动跳过：
+
+| 步骤 | 缓存位置 |
+|------|---------|
+| 视频下载 | `output_shorts/_work/session.json` |
+| Whisper 转录 | `视频名.mp4.whisper.json` |
+
+第二次运行直接从 Step 3 场景检测开始，节省大量时间。
 
 ## Whisper 模型选择
 
@@ -114,8 +128,10 @@ python viral_clip_maker.py "链接" \
 output_shorts/
 ├── short_01_score9.mp4   # 得分最高
 ├── short_02_score8.mp4
-├── short_03_score7.mp4
-└── _work/                # 中间文件（下载的原视频、字幕等）
+├── short_03_score8.mp4
+├── short_04_score7.mp4
+├── short_05_score7.mp4
+└── _work/                # 中间文件（原视频、字幕、缓存）
 ```
 
 所有短视频均为 1080×1920 竖屏，已烧录字幕，可直接发布。
