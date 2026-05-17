@@ -251,7 +251,7 @@ SCORE_PROMPT = """\
 4. 语义完整性（内容自成一段，有头有尾）
 5. 传播潜力（看完是否想分享）
 
-只返回 JSON 数组，格式：
+只返回 JSON 数组，不要有其他文字。reason 字段不要包含双引号。格式：
 [{{"index": 0, "score": 8.5, "reason": "一句话原因"}}, ...]
 
 片段列表：
@@ -312,11 +312,20 @@ def score_with_claude(
         segments_json=json.dumps(payload, ensure_ascii=False, indent=2)
     )
     raw = _call_api(prompt, model, api_key)
-    match = re.search(r"\[.*?\]", raw, re.DOTALL)
-    if not match:
-        raise ValueError(f"Claude 返回格式异常:\n{raw[:300]}")
 
-    scores = json.loads(match.group())
+    # 贪婪匹配完整 JSON 数组（非贪婪会截断嵌套结构）
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        raise ValueError(f"AI 返回格式异常:\n{raw[:300]}")
+
+    json_str = match.group()
+    try:
+        scores = json.loads(json_str)
+    except json.JSONDecodeError:
+        # reason 字段含特殊字符时尝试宽松解析：逐行提取 index/score
+        scores = []
+        for m in re.finditer(r'"index"\s*:\s*(\d+).*?"score"\s*:\s*([\d.]+)', json_str, re.DOTALL):
+            scores.append({"index": int(m.group(1)), "score": float(m.group(2)), "reason": ""})
     score_map = {item["index"]: item for item in scores}
 
     for i, seg in enumerate(segments):
