@@ -59,12 +59,6 @@ try:
 except ImportError:
     sys.exit("请安装: pip install anthropic")
 
-try:
-    import cv2
-    _CV2_AVAILABLE = True
-except ImportError:
-    print("[警告] opencv-python 未安装，将跳过人脸居中，使用画面中心裁剪")
-    _CV2_AVAILABLE = False
 
 # ============================================================
 # 默认参数
@@ -73,8 +67,6 @@ DEFAULT_OUTPUT_DIR = "./output_shorts"
 MAX_CLIPS          = 5
 CLIP_MIN_DURATION  = 30.0
 CLIP_MAX_DURATION  = 90.0
-TARGET_WIDTH       = 1080
-TARGET_HEIGHT      = 1920
 WHISPER_MODEL      = "medium"
 CLAUDE_MODEL       = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
@@ -342,63 +334,6 @@ def score_with_claude(
     return ranked
 
 
-# ============================================================
-# Step 6: 获取视频分辨率
-# ============================================================
-def get_video_size(video_path: str) -> Tuple[int, int]:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "json", video_path,
-    ]
-    out = subprocess.run(cmd, capture_output=True, text=True)
-    info = json.loads(out.stdout)["streams"][0]
-    return info["width"], info["height"]
-
-
-# ============================================================
-# Step 6: 人脸居中竖屏裁剪参数
-# ============================================================
-def build_crop_filter(video_path: str, seg: Segment) -> str:
-    src_w, src_h = get_video_size(video_path)
-
-    # 竖屏目标比例 9:16，从原视频裁出合适宽度
-    crop_w = int(src_h * 9 / 16)
-    crop_w = min(crop_w, src_w)
-    crop_h = src_h
-
-    # 人脸居中
-    face_cx = src_w // 2  # 默认画面中心
-    if _CV2_AVAILABLE:
-        face_cx = _detect_face_cx(video_path, (seg.start + seg.end) / 2, src_w)
-
-    crop_x = max(0, min(face_cx - crop_w // 2, src_w - crop_w))
-
-    return (
-        f"crop={crop_w}:{crop_h}:{crop_x}:0,"
-        f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}"
-    )
-
-
-def _detect_face_cx(video_path: str, timestamp: float, frame_width: int) -> int:
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        return frame_width // 2
-
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-
-    if len(faces) == 0:
-        return frame_width // 2
-
-    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-    return x + w // 2
 
 
 # ============================================================
@@ -508,7 +443,6 @@ def export_clip(
     clip_idx: int,
     work_dir: str,
 ) -> None:
-    crop_filter = build_crop_filter(video_path, seg)
     duration = seg.end - seg.start
 
     # 优先使用 subtitles 滤镜（需 libass），否则降级用 drawtext
@@ -518,23 +452,23 @@ def export_clip(
         write_ass(whisper_segs, seg, ass_path)
         tmp_ass = f"/tmp/viral_clip_{clip_idx:02d}.ass"
         shutil.copy2(ass_path, tmp_ass)
-        sub_filter = f"subtitles={tmp_ass}"
+        vf = f"subtitles={tmp_ass}"
     else:
         sub_filter = build_drawtext_chain(whisper_segs, seg, work_dir, clip_idx)
-
-    vf = f"{crop_filter},{sub_filter}" if sub_filter else crop_filter
+        vf = sub_filter if sub_filter else None
 
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(seg.start),
         "-i", video_path,
         "-t", str(duration),
-        "-vf", vf,
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
-        out_path,
     ]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd.append(out_path)
 
     print(f"  [剪辑 {clip_idx+1}] {seg.start:.1f}s → {seg.end:.1f}s ({duration:.0f}s) 分数: {seg.score:.1f}")
     result = subprocess.run(cmd, capture_output=True, text=True)
